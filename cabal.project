@@ -1,0 +1,6 @@
+packages: .
+
+source-repository-package
+    type: git
+    location: https://github.com/hussein-aitlahcen/evm-opcodes
+    tag: 2bfdb370a83da5c6f06e6d157bb6b037f0028afd
