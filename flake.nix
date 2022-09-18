@@ -13,7 +13,7 @@
             zlib
             secp256k1
             libff
-            (haskell-language-server.override { supportedGhcVersions = ["924"] ; })
+            (haskell-language-server.override { supportedGhcVersions = ["902"] ; })
           ];
         };
       });

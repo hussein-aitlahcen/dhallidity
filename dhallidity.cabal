@@ -8,7 +8,7 @@ bug-reports:    https://github.com/hussein-aitlahcen/dhallidity/issues
 author:         Hussein Ait Lahcen
 maintainer:     hussein.aitlahcen@gmail.com
 copyright:      2022 Hussein Ait Lahcen
-license:        GPL3
+license:        GPL-3
 license-file:   LICENSE
 build-type:     Simple
 extra-source-files:
@@ -33,6 +33,9 @@ library
     , dhall
     , evm-opcodes
     , containers
+    , data-dword
+    , mtl
+    , lens
   default-language: Haskell2010
 
 executable dhallidity-exe
