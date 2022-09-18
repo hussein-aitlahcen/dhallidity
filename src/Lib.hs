@@ -13,7 +13,9 @@
 module Lib (execute) where
 
 import Control.Lens hiding (Const, Context)
+import Control.Monad.Except (ExceptT (..), runExceptT, throwError)
 import Control.Monad.State.Strict (MonadIO (liftIO), StateT (..))
+import Control.Monad.Trans (lift)
 import Data.Bifoldable (bitraverse_)
 import Data.Bits (Bits (..))
 import Data.DoubleWord (Word256 (Word256))
@@ -58,24 +60,14 @@ makeLenses ''CplState
 
 execute :: IO ()
 execute = do
-  {- This program compiles to 0x303162079f2c01470100
-     Resulting hex bytecode can be decompiled on https://ethervm.io/decompile
-
-     contract Contract {
-         function main() {
-             var var0 = address(this).balance + address(this).balance + 0x079f2c;
-             stop();
-         }
-     }
-  -}
+  {- Resulting hex bytecode can be decompiled on https://ethervm.io/decompile -}
   -- Parse + Resolve imports
   program <-
     traverse
       load
       ( exprFromText
           "program"
-          "let T = { q: Natural, x: Natural, y: { a: Natural, b: Natural } , z: Natural } in \
-          \let value: T = env.mload T (env.mload Natural 0x40) \
+          "let T = { q: Natural, x: Natural, y: { a: Natural, b: Natural } , z: Natural } \
           \in env.mload T (env.mstore T { q = 0xCAFE, x = 0xBABE, y = { a = 0xDEAD, b = 0xC0DE }, z = 0xBEEF } (env.mload Natural 0x40))"
       )
   bitraverse_
@@ -83,7 +75,11 @@ execute = do
     ( ( \validProgram ->
           bitraverse_
             print
-            (\programType -> go programType validProgram)
+            ( \programType ->
+                if fromRight (error "typechecked; qed;") (D.typeOf @Void programType) /= Const Type
+                  then error "must be type; sorry bro; qed;"
+                  else go programType validProgram
+            )
             (D.typeWith initialContext validProgram)
       )
         . denote
@@ -118,7 +114,9 @@ execute = do
       putStrLn "<<========================>>"
       putStrLn ""
       putStrLn ">> Compiling..."
-      (compiled, _) <- runStateT (compile normalized) (CplState 0 mempty)
+      (compiled, _) <-
+        either (error . show) id
+          <$> runExceptT (runStateT (compile normalized) (CplState 0 mempty))
       putStrLn ">> Compilation done."
       print $ ">> Bytecode: " <> show compiled
       putStrLn ""
@@ -280,91 +278,92 @@ initialContext =
 maxWord256 :: Natural
 maxWord256 = fromIntegral $ maxBound @Word256
 
-sizeOf :: Expr Void Void -> Either String Word256
-sizeOf Natural = Right 32
+sizeOf :: Monad m => Expr Void Void -> ExceptT String m Word256
+sizeOf Natural = pure 32
 sizeOf (Record fields) = do
   sizes <- traverse (sizeOf . recordFieldValue) (M.elems $ toMap fields)
   pure $ getSum $ foldMap Sum sizes
-sizeOf x = Left $ "Not sizeable: " <> show x
+sizeOf x = throwError $ "Not sizeable: " <> show x
 
-offsetOf :: Text -> Expr Void Void -> Either String Word256
+offsetOf :: Monad m => Text -> Expr Void Void -> ExceptT String m Word256
 offsetOf field (Record fields) = do
   let fields' = toMap fields
       index = M.findIndex field fields'
   sizeOf (Record $ fromList $ take index $ M.toList fields')
-offsetOf _ x = Left $ "Not offsetable: " <> show x
+offsetOf _ x = throwError $ "Not offsetable: " <> show x
 
-compile :: Expr Void Void -> StateT CplState IO [Opcode]
-compile (NaturalLit x)
-  | x <= maxWord256 = pure [push x]
-compile (IntegerLit x)
-  | x <= fromIntegral maxWord256 = pure [push x]
-compile (NaturalPlus x y) = do
-  p <- compile y
-  q <- compile x
-  pure $ p <> q <> [ADD]
-compile (App (App NaturalSubtract x) y) = do
-  p <- compile y
-  q <- compile x
-  pure $ p <> q <> [SUB]
-compile (Field (Var (V "env" _)) (FieldSelection _ builtin _))
-  | M.member builtin builtinOpcodes =
-    pure $ fromMaybe (error "member; qed;") $ builtinOpcodes M.!? builtin
--- Builtin env.mstore
-compile (App (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr) offsetExpr)
-  | builtin == bindingOf MStore = do
-    let size = either (error . show) id $ sizeOf typeExpr
-        nbOfWord256 = if size `mod` 32 == 0 then size `div` 32 else (size `div` 32) + 1
-    value <- compile valueExpr
-    offset <- compile offsetExpr
-    pure $ value <> ((\x -> offset <> [push $ (x + 1) * 32, push size, SUB, ADD, MSTORE]) =<< [0 .. nbOfWord256 - 1]) <> offset
--- Builtin env.mload
-compile (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) offsetExpr)
-  | builtin == bindingOf MLoad = do
-    let size = either (error . show) id $ sizeOf typeExpr
-        nbOfWord256 = if size `mod` 32 == 0 then size `div` 32 else (size `div` 32) + 1
-    offset <- compile offsetExpr
-    pure $ (\x -> offset <> [push $ x * 32, ADD, MLOAD]) =<< [0 .. nbOfWord256 - 1]
--- Builtin env.<trivialUnaryFunction>
-compile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) x)
-  | M.member builtin builtinOpcodes = do
-    p <- compile x
-    pure $ p <> fromMaybe (error "member; qed;") (builtinOpcodes M.!? builtin)
-compile (App x y) = do
-  p <- compile y
-  q <- compile x
-  pure $ p <> q
-compile (Field x (FieldSelection _ y _)) = do
-  let ty@(Record fields) = either (error . show) id $ D.typeWith initialContext x
-      (RecordField _ fieldTy _ _) = (M.!) (toMap fields) y
-      offset = either (error . show) id (offsetOf y ty) `div` 32
-      size = either (error . show) id (sizeOf ty) `div` 32
-      stackMax = size
-      fieldSize = either (error . show) id (sizeOf fieldTy) `div` 32
-      fieldStackStart = size - offset - 1
-      fieldStackEnd = fieldStackStart - fieldSize + 1
-      delta = stackMax - fieldStackEnd - fieldSize
-  liftIO $
-    putStrLn $
-      "Selecting " <> T.unpack y
-        <> " of type "
-        <> show (prettyExpr fieldTy)
-        <> " at offset "
-        <> show offset
-        <> " in "
-        <> show (prettyExpr ty)
-  p <- compile x
-  let storeTemp i = [push $ (fieldSize - i - 1) * 32] <> mload 0x40 <> [ADD, MSTORE]
-  let restoreTemp i = [push $ i * 32] <> mload 0x40 <> [ADD, MLOAD]
-  pure $
-    p
-      <> traceShowId (replicate (fromIntegral fieldStackEnd) POP)
-      <> traceShowId (storeTemp =<< [0 .. fieldSize - 1])
-      <> traceShowId (replicate (fromIntegral delta) POP)
-      <> traceShowId (restoreTemp =<< [0 .. fieldSize - 1])
-compile (RecordLit fields) = do
-  mconcat . M.elems <$> traverse (compile . recordFieldValue) (toMap fields)
-compile x = error $ "NOT YET SUPPORTED :'(: " <> show x
+compile :: Expr Void Void -> StateT CplState (ExceptT String IO) [Opcode]
+compile = doCompile
+  where
+    doCompile :: Expr Void Void -> StateT CplState (ExceptT String IO) [Opcode]
+    doCompile (NaturalLit x)
+      | x <= maxWord256 = pure [push x]
+    doCompile (IntegerLit x)
+      | x <= fromIntegral maxWord256 = pure [push x]
+    doCompile (NaturalPlus x y) = do
+      p <- doCompile y
+      q <- doCompile x
+      pure $ p <> q <> [ADD]
+    doCompile (App (App NaturalSubtract x) y) = do
+      p <- doCompile y
+      q <- doCompile x
+      pure $ p <> q <> [SUB]
+    doCompile (Field (Var (V "env" _)) (FieldSelection _ builtin _))
+      | M.member builtin builtinOpcodes =
+        pure $ fromMaybe (error "member; qed;") $ builtinOpcodes M.!? builtin
+    -- Builtin env.mstore
+    doCompile (App (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr) offsetExpr)
+      | builtin == bindingOf MStore = do
+        size <- (`div` 32) <$> lift (sizeOf typeExpr)
+        value <- doCompile valueExpr
+        offset <- doCompile offsetExpr
+        pure $ value <> ((\x -> offset <> [push $ (x + 1) * 32, push $ size * 32, SUB, ADD, MSTORE]) =<< [0 .. size - 1]) <> offset
+    -- Builtin env.mload
+    doCompile (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) offsetExpr)
+      | builtin == bindingOf MLoad = do
+        size <- (`div` 32) <$> lift (sizeOf typeExpr)
+        offset <- doCompile offsetExpr
+        pure $ (\x -> offset <> [push $ x * 32, ADD, MLOAD]) =<< [0 .. size - 1]
+    -- Builtin env.<trivialUnaryFunction>
+    doCompile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) x)
+      | M.member builtin builtinOpcodes = do
+        p <- doCompile x
+        pure $ p <> fromMaybe (error "member; qed;") (builtinOpcodes M.!? builtin)
+    doCompile (App x y) = do
+      p <- doCompile y
+      q <- doCompile x
+      pure $ p <> q
+    doCompile (Field x (FieldSelection _ y _)) = do
+      let ty@(Record fields) = fromRight "typechecked; qed;" $ D.typeWith initialContext x
+          (RecordField _ fieldTy _ _) = toMap fields M.! y
+      offset <- (`div` 32) <$> lift (offsetOf y ty)
+      size <- (`div` 32) <$> lift (sizeOf ty)
+      fieldSize <- (`div` 32) <$> lift (sizeOf fieldTy)
+      let stackMax = size
+          fieldStackStart = size - offset - 1
+          fieldStackEnd = fieldStackStart - fieldSize + 1
+          delta = stackMax - fieldStackEnd - fieldSize
+      liftIO $
+        putStrLn $
+          "Selecting " <> T.unpack y
+            <> " of type "
+            <> show (prettyExpr fieldTy)
+            <> " at offset "
+            <> show offset
+            <> " in "
+            <> show (prettyExpr ty)
+      p <- doCompile x
+      let storeTemp i = [push $ (fieldSize - i - 1) * 32] <> mload 0x40 <> [ADD, MSTORE]
+          restoreTemp i = [push $ i * 32] <> mload 0x40 <> [ADD, MLOAD]
+      pure $
+        p
+          <> replicate (fromIntegral fieldStackEnd) POP
+          <> (storeTemp =<< [0 .. fieldSize - 1])
+          <> replicate (fromIntegral delta) POP
+          <> (restoreTemp =<< [0 .. fieldSize - 1])
+    doCompile (RecordLit fields) = do
+      mconcat . M.elems <$> traverse (doCompile . recordFieldValue) (toMap fields)
+    doCompile x = error $ "NOT YET SUPPORTED :'(: " <> show x
 
 allocate :: Word256 -> [Opcode]
 allocate x = [push $ x * 32] <> mload 0x40 <> [ADD, push 0x40, MSTORE]
