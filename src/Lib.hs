@@ -23,8 +23,9 @@ import Data.Either (either, fromRight)
 import Data.Foldable (foldl', traverse_)
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Map as M
-import Data.Maybe (fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Monoid (Sum (..))
+import Data.Semigroup (Max (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Void (Void)
@@ -67,8 +68,8 @@ execute = do
       load
       ( exprFromText
           "program"
-          "let T = { q: Natural, x: Natural, y: { a: Natural, b: Natural } , z: Natural } \
-          \in env.mload T (env.mstore T { q = 0xCAFE, x = 0xBABE, y = { a = 0xDEAD, b = 0xC0DE }, z = 0xBEEF } (env.mload Natural 0x40))"
+          "let T = < X: Natural | Y: { a: Natural, b: Natural } | Z: Natural > \
+          \in env.mload T (env.mstore T (T.Y { a = 0xCAFEBABEDEADC0DE, b = 0xBEEF }) (env.mload Natural 0x40))"
       )
   bitraverse_
     print
@@ -280,12 +281,15 @@ maxWord256 = fromIntegral $ maxBound @Word256
 
 sizeOf :: Monad m => Expr Void Void -> ExceptT String m Word256
 sizeOf Natural = pure 32
+sizeOf (Union fields) = do
+  (+ 32) . maximum <$> traverse sizeOf (catMaybes $ M.elems $ toMap fields)
 sizeOf (Record fields) = do
-  sizes <- traverse (sizeOf . recordFieldValue) (M.elems $ toMap fields)
+  sizes <- traverse (sizeOf . recordFieldValue) $ M.elems $ toMap fields
   pure $ getSum $ foldMap Sum sizes
 sizeOf x = throwError $ "Not sizeable: " <> show x
 
 offsetOf :: Monad m => Text -> Expr Void Void -> ExceptT String m Word256
+offsetOf _ (Union _) = pure 32
 offsetOf field (Record fields) = do
   let fields' = toMap fields
       index = M.findIndex field fields'
@@ -333,34 +337,39 @@ compile = doCompile
       p <- doCompile y
       q <- doCompile x
       pure $ p <> q
-    doCompile (Field x (FieldSelection _ y _)) = do
-      let ty@(Record fields) = fromRight "typechecked; qed;" $ D.typeWith initialContext x
-          (RecordField _ fieldTy _ _) = toMap fields M.! y
-      offset <- (`div` 32) <$> lift (offsetOf y ty)
-      size <- (`div` 32) <$> lift (sizeOf ty)
-      fieldSize <- (`div` 32) <$> lift (sizeOf fieldTy)
-      let stackMax = size
-          fieldStackStart = size - offset - 1
-          fieldStackEnd = fieldStackStart - fieldSize + 1
-          delta = stackMax - fieldStackEnd - fieldSize
-      liftIO $
-        putStrLn $
-          "Selecting " <> T.unpack y
-            <> " of type "
-            <> show (prettyExpr fieldTy)
-            <> " at offset "
-            <> show offset
-            <> " in "
-            <> show (prettyExpr ty)
-      p <- doCompile x
-      let storeTemp i = [push $ (fieldSize - i - 1) * 32] <> mload 0x40 <> [ADD, MSTORE]
-          restoreTemp i = [push $ i * 32] <> mload 0x40 <> [ADD, MLOAD]
-      pure $
-        p
-          <> replicate (fromIntegral fieldStackEnd) POP
-          <> (storeTemp =<< [0 .. fieldSize - 1])
-          <> replicate (fromIntegral delta) POP
-          <> (restoreTemp =<< [0 .. fieldSize - 1])
+    doCompile (Field x (FieldSelection _ y _)) =
+      case (fromRight "typechecked; qed;" $ D.typeWith initialContext x, x) of
+        (Const Type, ty@(Union fields)) -> do
+          let !index = traceShowId $ M.findIndex y $ toMap fields
+          pure [push index]
+        (ty@(Record fields), _) -> do
+          let (RecordField _ fieldTy _ _) = toMap fields M.! y
+          offset <- (`div` 32) <$> lift (offsetOf y ty)
+          size <- (`div` 32) <$> lift (sizeOf ty)
+          fieldSize <- (`div` 32) <$> lift (sizeOf fieldTy)
+          let stackMax = size
+              fieldStackStart = size - offset - 1
+              fieldStackEnd = fieldStackStart - fieldSize + 1
+              delta = stackMax - fieldStackEnd - fieldSize
+          liftIO $
+            putStrLn $
+              "Selecting " <> T.unpack y
+                <> " of type "
+                <> show (prettyExpr fieldTy)
+                <> " at offset "
+                <> show offset
+                <> " in "
+                <> show (prettyExpr ty)
+          p <- doCompile x
+          let storeTemp i = [push $ (fieldSize - i - 1) * 32] <> mload 0x40 <> [ADD, MSTORE]
+              restoreTemp i = [push $ i * 32] <> mload 0x40 <> [ADD, MLOAD]
+          pure $
+            p
+              <> replicate (fromIntegral fieldStackEnd) POP
+              <> (storeTemp =<< [0 .. fieldSize - 1])
+              <> replicate (fromIntegral delta) POP
+              <> (restoreTemp =<< [0 .. fieldSize - 1])
+        x -> error $ show x
     doCompile (RecordLit fields) = do
       mconcat . M.elems <$> traverse (doCompile . recordFieldValue) (toMap fields)
     doCompile x = error $ "NOT YET SUPPORTED :'(: " <> show x
