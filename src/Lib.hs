@@ -89,14 +89,12 @@ execute = do
       load
       ( exprFromText
           "program"
-          "let T = < A | X: Natural | Y: { a: Natural, b: Natural } | Z: Natural > \
+          "let Message = < SetValue: Natural | ResetValue > \
           \ in merge \
-          \ { A = env.mload Natural 0x00 \
-          \ , X = \\(x: Natural) -> x \
-          \ , Y = \\(x: { a: Natural, b: Natural }) -> x.b + x.a \
-          \ , Z = \\(x: Natural) -> x + x \
+          \ { SetValue = \\(x: Natural) -> env.sstore Natural x 0 \
+          \ , ResetValue = env.sstore Natural 0 0 \
           \ } \
-          \ (env.sload T (env.sstore T (T.Y { a = 0xCAFEBABE, b = 0xDEADC0DE }) 0))"
+          \ (env.callDataLoad Message)"
       )
   bitraverse_
     print
@@ -229,7 +227,7 @@ instance Builtin BuiltinValue where
   typeOf BalanceOf = Pi Nothing "_" (referTo BuiltinAddress) Natural
   typeOf MLoad = Pi Nothing "T" (Const Type) $ Pi Nothing "_" Natural $ Var $ V "T" 0
   typeOf MStore = Pi Nothing "T" (Const Type) $ Pi Nothing "_" (Var $ V "T" 0) $ Pi Nothing "_" Natural Natural
-  typeOf CallDataLoad = Pi Nothing "_" Natural Natural
+  typeOf CallDataLoad = Pi Nothing "T" (Const Type) $ Var $ V "T" 0
   typeOf CallDataCopy = Pi Nothing "_" Natural $ Pi Nothing "_" Natural $ Pi Nothing "_" Natural $ Record mempty
   typeOf SLoad = Pi Nothing "T" (Const Type) $ Pi Nothing "_" Natural $ Var $ V "T" 0
   typeOf SStore = Pi Nothing "T" (Const Type) $ Pi Nothing "_" (Var $ V "T" 0) $ Pi Nothing "_" Natural Natural
@@ -386,6 +384,11 @@ compile = doCompile
         size <- (`div` 32) <$> lift (sizeOf typeExpr)
         offset <- doCompile offsetExpr
         pure $ (\x -> offset <> [push x, ADD, SLOAD]) =<< [0 .. size - 1]
+    -- Builtin env.callDataLoad
+    doCompile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr)
+      | builtin == bindingOf CallDataLoad = do
+        size <- (`div` 32) <$> lift (sizeOf typeExpr)
+        pure $ (\x -> [push $ x * 32, CALLDATALOAD]) =<< [0 .. size - 1]
     -- Builtin env.<trivialUnaryFunction>
     doCompile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) x)
       | M.member builtin builtinOpcodes = do
@@ -511,11 +514,22 @@ compile = doCompile
           normalize $
             App
               (Lam c binding body)
-              ( App ( App ( Field (Var (V "env" 0)) (FieldSelection Nothing (bindingOf MLoad) Nothing)) ann) (NaturalLit (fromIntegral $ slot * 32)))
+              ( App
+                  ( App
+                      ( Field
+                          (Var (V "env" 0))
+                          (FieldSelection Nothing (bindingOf MLoad) Nothing)
+                      )
+                      ann
+                  )
+                  (NaturalLit (fromIntegral $ slot * 32))
+              )
       localBindings %= M.delete var
       -- trick: pop the returned offset
       pure $ p <> (POP : q)
-    doCompile x = error $ "Ser, everything has limits..." <> show x
+    doCompile (Union _) = pure []
+    doCompile (Record _) = pure []
+    doCompile x = error $ "Ser, everything has limits... " <> show x
 
 freepointer :: [LabelledOpcode]
 freepointer = [push 0x00, MLOAD]
