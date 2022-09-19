@@ -9,10 +9,12 @@
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 {-# HLINT ignore "Avoid lambda using `infix`" #-}
+{-# HLINT ignore "Use camelCase" #-}
 
 module Lib (execute) where
 
 import Control.Lens hiding (Const, Context)
+import Control.Monad (foldM, guard, when)
 import Control.Monad.Except (ExceptT (..), runExceptT, throwError)
 import Control.Monad.State.Strict (MonadIO (liftIO), StateT (..))
 import Control.Monad.Trans (lift)
@@ -23,19 +25,19 @@ import Data.Either (either, fromRight)
 import Data.Foldable (foldl', traverse_)
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Map as M
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, fromJust, fromMaybe)
 import Data.Monoid (Sum (..))
 import Data.Semigroup (Max (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Void (Void)
 import Data.Word (Word64)
-import Debug.Trace (traceShowId)
 import Dhall.Context (Context, empty, insert)
 import Dhall.Core
   ( Const (..),
     Expr (..),
     FieldSelection (..),
+    FunctionBinding (functionBindingAnnotation, functionBindingVariable),
     RecordField (..),
     Var (..),
     denote,
@@ -48,12 +50,31 @@ import Dhall.Parser (exprFromText)
 import Dhall.Pretty (prettyExpr)
 import qualified Dhall.TypeCheck as D (typeOf, typeWith)
 import EVM.Opcode (Opcode (..), Opcode' (..), toHex, pattern DUP1)
+import qualified EVM.Opcode as O
 import EVM.Opcode.Internal (Ord16 (..))
+import EVM.Opcode.Labelled (LabelledOpcode)
+import qualified EVM.Opcode.Labelled as L
+import qualified EVM.Opcode.Positional as P
 import Numeric.Natural (Natural)
 
+mAX_DYNAMIC_LOCALS :: Word256
+mAX_DYNAMIC_LOCALS = 256
+
+rESERVED_LOCALS :: Word256
+rESERVED_LOCALS = 1
+
+data CplVar = CplVar
+  { _typ :: Expr Void Void,
+    _memorySlot :: Word256
+  }
+  deriving stock (Eq, Show)
+
+makeLenses ''CplVar
+
 data CplState = CplState
-  { _memoryPointer :: Word256,
-    _bindingPointer :: M.Map Text Word256
+  { _localBindings :: M.Map Text CplVar,
+    _nextLabel :: Int,
+    _memorySlotNext :: Word256
   }
   deriving stock (Eq, Show)
 
@@ -69,7 +90,12 @@ execute = do
       ( exprFromText
           "program"
           "let T = < X: Natural | Y: { a: Natural, b: Natural } | Z: Natural > \
-          \in env.mload T (env.mstore T (T.Y { a = 0xCAFEBABEDEADC0DE, b = 0xBEEF }) (env.mload Natural 0x40))"
+          \ in merge \
+          \ { X = \\(x: Natural) -> x \
+          \ , Y = \\(x: { a: Natural, b: Natural }) -> x.b + x.a \
+          \ , Z = \\(x: Natural) -> x + x \
+          \ } \
+          \ (env.mload T (env.mstore T (T.Y { a = 0xCAFEBABE, b = 0xDEADC0DE }) (env.mload Natural 0x00)))"
       )
   bitraverse_
     print
@@ -100,7 +126,7 @@ execute = do
       putStrLn "<<== BASE ==>>"
       putStrLn "<<==========>>"
       putStrLn ""
-      print $ prettyExpr $ denote @_ @_ @Void validProgram
+      print $ prettyExpr validProgram
       putStrLn ""
       putStrLn "<<================>>"
       putStrLn "<<== NORMALIZED ==>>"
@@ -117,7 +143,7 @@ execute = do
       putStrLn ">> Compiling..."
       (compiled, _) <-
         either (error . show) id
-          <$> runExceptT (runStateT (compile normalized) (CplState 0 mempty))
+          <$> runExceptT (runStateT (compile normalized) (CplState mempty 0 rESERVED_LOCALS))
       putStrLn ">> Compilation done."
       print $ ">> Bytecode: " <> show compiled
       putStrLn ""
@@ -125,7 +151,11 @@ execute = do
       putStrLn "<<== HEX BYTECODES ==>>"
       putStrLn "<<===================>>"
       putStrLn ""
-      putStrLn $ toHex $ [PUSH 0x60, PUSH 0x40, MSTORE] <> compiled <> [STOP]
+      putStrLn $
+        toHex $
+          P.translate $
+            fromRight (error "impossible; qed;") $
+              L.translate $ [push $ 32 * mAX_DYNAMIC_LOCALS, PUSH 0x00, MSTORE] <> compiled <> [STOP]
 
 class Builtin a where
   typeOf :: a -> Expr Void Void
@@ -136,7 +166,7 @@ class Builtin a => BuiltinType a where
   referTo x = Var (V (bindingOf x) 0)
 
 class BuiltinOpcode a where
-  opcode :: a -> [Opcode]
+  opcode :: a -> [LabelledOpcode]
 
 data BuiltinAddress = BuiltinAddress
 
@@ -250,7 +280,7 @@ instance BuiltinOpcode BuiltinValue where
   opcode CallDataLoad = [CALLDATALOAD]
   opcode CallDataCopy = [CALLDATACOPY]
 
-builtinOpcodes :: M.Map Text [Opcode]
+builtinOpcodes :: M.Map Text [LabelledOpcode]
 builtinOpcodes =
   M.fromList $
     (\x -> (bindingOf x, opcode x))
@@ -296,10 +326,16 @@ offsetOf field (Record fields) = do
   sizeOf (Record $ fromList $ take index $ M.toList fields')
 offsetOf _ x = throwError $ "Not offsetable: " <> show x
 
-compile :: Expr Void Void -> StateT CplState (ExceptT String IO) [Opcode]
+getType :: Expr Void Void -> StateT CplState (ExceptT String IO) (Expr Void Void)
+getType x = do
+  extraContext <- use localBindings
+  let context = M.foldrWithKey insert initialContext (view typ <$> extraContext)
+  pure $ fromRight "typechecked; qed;" $ D.typeWith context x
+
+compile :: Expr Void Void -> StateT CplState (ExceptT String IO) [LabelledOpcode]
 compile = doCompile
   where
-    doCompile :: Expr Void Void -> StateT CplState (ExceptT String IO) [Opcode]
+    doCompile :: Expr Void Void -> StateT CplState (ExceptT String IO) [LabelledOpcode]
     doCompile (NaturalLit x)
       | x <= maxWord256 = pure [push x]
     doCompile (IntegerLit x)
@@ -337,11 +373,19 @@ compile = doCompile
       p <- doCompile y
       q <- doCompile x
       pure $ p <> q
-    doCompile (Field x (FieldSelection _ y _)) =
-      case (fromRight "typechecked; qed;" $ D.typeWith initialContext x, x) of
+    doCompile (Field x (FieldSelection _ y _)) = do
+      tyX <- getType x
+      case (tyX, x) of
         (Const Type, ty@(Union fields)) -> do
-          let !index = traceShowId $ M.findIndex y $ toMap fields
-          pure [push index]
+          let fields' = toMap fields
+              index = M.findIndex y fields'
+          size <- (`div` 32) <$> lift (sizeOf x)
+          variantSize <- (`div` 32) <$> lift (sizeOf (fromJust $ fields' M.! y))
+          liftIO $ print "Union"
+          liftIO $ print variantSize
+          liftIO $ print size
+          liftIO $ print x
+          pure $ replicate (fromIntegral $ size - variantSize - 1) (push 0) <> [push index]
         (ty@(Record fields), _) -> do
           let (RecordField _ fieldTy _ _) = toMap fields M.! y
           offset <- (`div` 32) <$> lift (offsetOf y ty)
@@ -350,7 +394,12 @@ compile = doCompile
           let stackMax = size
               fieldStackStart = size - offset - 1
               fieldStackEnd = fieldStackStart - fieldSize + 1
-              delta = stackMax - fieldStackEnd - fieldSize
+              tail = stackMax - fieldStackEnd - fieldSize
+          liftIO $ putStrLn "==============="
+          liftIO $ print $ "Size: " <> show size
+          liftIO $ print $ "FieldSize: " <> show fieldSize
+          liftIO $ print $ "Offset: " <> show offset
+          liftIO $ print $ "Tail: " <> show tail
           liftIO $
             putStrLn $
               "Selecting " <> T.unpack y
@@ -361,39 +410,114 @@ compile = doCompile
                 <> " in "
                 <> show (prettyExpr ty)
           p <- doCompile x
-          let storeTemp i = [push $ (fieldSize - i - 1) * 32] <> mload 0x40 <> [ADD, MSTORE]
-              restoreTemp i = [push $ i * 32] <> mload 0x40 <> [ADD, MLOAD]
+          let storeTemp i = [push $ (fieldSize - i - 1) * 32] <> mload 0x00 <> [ADD, MSTORE]
+              restoreTemp i = [push $ i * 32] <> mload 0x00 <> [ADD, MLOAD]
           pure $
             p
               <> replicate (fromIntegral fieldStackEnd) POP
               <> (storeTemp =<< [0 .. fieldSize - 1])
-              <> replicate (fromIntegral delta) POP
+              <> replicate (fromIntegral tail) POP
               <> (restoreTemp =<< [0 .. fieldSize - 1])
         x -> error $ show x
     doCompile (RecordLit fields) = do
       mconcat . M.elems <$> traverse (doCompile . recordFieldValue) (toMap fields)
-    doCompile x = error $ "NOT YET SUPPORTED :'(: " <> show x
+    doCompile (Merge (RecordLit fields) unionExpr c) = do
+      liftIO $ print fields
+      p <- compile unionExpr
+      unionType <- getType unionExpr
+      unionSize <- (`div` 32) <$> lift (sizeOf unionType)
+      let fields' = M.elems $ toMap fields
+      (_, q) <-
+        foldM
+          ( \(i, fallback) caseExpr -> do
+              match <- compile caseExpr
+              label <- use nextLabel
+              nextLabel += 1
+              let (RecordField _ (Lam _ binding _) _ _) = fields' !! i
+              variantSize <- (`div` 32) <$> lift (sizeOf $ functionBindingAnnotation binding)
+              liftIO $ print $ "Size: " <> show unionSize <> ", Variant: " <> show variantSize
+              pure
+                ( i + 1,
+                  iff
+                    label
+                    [DUP1, push i, O.EQ]
+                    -- pop the tag and padding as we wipe the union when matching
+                    (replicate (fromIntegral $ unionSize - variantSize) POP <> match)
+                    fallback
+                )
+          )
+          (0, [push 0, push 0, REVERT])
+          (recordFieldValue <$> fields')
+      pure $ p <> q
+    doCompile (Lam c binding body) = do
+      let ann = functionBindingAnnotation binding
+          var = functionBindingVariable binding
+      size <- (`div` 32) <$> lift (sizeOf ann)
+      slot <- use memorySlotNext
+      memorySlotNext += size
+      when
+        (slot + size > mAX_DYNAMIC_LOCALS)
+        (throwError "Ser, memory has limits...")
+      liftIO $ putStrLn "==============="
+      liftIO $ print $ "ValueType: " <> prettyExpr ann
+      liftIO $ print $ "Slot: " <> show slot
+      localBindings %= M.insert var (CplVar ann slot)
+      -- store
+      p <-
+        compile
+          ( App
+              ( App
+                  ( App
+                      ( Field
+                          (Var (V "env" 0))
+                          (FieldSelection Nothing (bindingOf MStore) Nothing)
+                      )
+                      ann
+                  )
+                  -- already on the stack
+                  (RecordLit mempty)
+              )
+              (NaturalLit (fromIntegral $ slot * 32))
+          )
+      -- alpha normalize with slot ref
+      q <-
+        compile $
+          normalize $
+            App
+              (Lam c binding body)
+              ( App ( App ( Field (Var (V "env" 0)) (FieldSelection Nothing (bindingOf MLoad) Nothing)) ann) (NaturalLit (fromIntegral $ slot * 32)))
+      localBindings %= M.delete var
+      -- trick: pop the returned offset
+      pure $ p <> (POP : q)
+    doCompile x = error $ "Ser, everything has limits..." <> show x
 
-allocate :: Word256 -> [Opcode]
-allocate x = [push $ x * 32] <> mload 0x40 <> [ADD, push 0x40, MSTORE]
+freepointer :: [LabelledOpcode]
+freepointer = [push 0x00, MLOAD]
 
-deallocate :: Word256 -> [Opcode]
-deallocate x = [push $ x * 32] <> mload 0x40 <> [SUB, push 0x40, MSTORE]
-
-push :: Integral a => a -> Opcode
+push :: Integral a => a -> LabelledOpcode
 push = PUSH . fromIntegral
 
-mload :: Word256 -> [Opcode]
+mload :: Word256 -> [LabelledOpcode]
 mload offset = [PUSH offset, MLOAD]
 
-mstore :: Word256 -> Word256 -> [Opcode]
+mstore :: Word256 -> Word256 -> [LabelledOpcode]
 mstore value offset = [PUSH value, PUSH offset, MSTORE]
 
-mstore8 :: Word256 -> Word256 -> [Opcode]
+mstore8 :: Word256 -> Word256 -> [LabelledOpcode]
 mstore8 value offset = [PUSH value, PUSH offset, MSTORE]
 
-sload :: Word256 -> [Opcode]
+sload :: Word256 -> [LabelledOpcode]
 sload key = [PUSH key, SLOAD]
 
-sstore :: Word256 -> Word256 -> [Opcode]
+sstore :: Word256 -> Word256 -> [LabelledOpcode]
 sstore key value = [PUSH value, PUSH key, SSTORE]
+
+iff :: Int -> [LabelledOpcode] -> [LabelledOpcode] -> [LabelledOpcode] -> [LabelledOpcode]
+iff nb cond true false =
+  let labelSuffix = "_" <> T.pack (show nb)
+   in cond
+        <> [JUMPI $ "true" <> labelSuffix]
+        <> false
+        <> [JUMP $ "end" <> labelSuffix, JUMPDEST $ "true" <> labelSuffix]
+        <> true
+        <> [JUMPDEST $ "end" <> labelSuffix]
