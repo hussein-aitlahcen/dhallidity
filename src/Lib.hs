@@ -96,7 +96,7 @@ execute = do
           \ , Y = \\(x: { a: Natural, b: Natural }) -> x.b + x.a \
           \ , Z = \\(x: Natural) -> x + x \
           \ } \
-          \ (env.mload T (env.mstore T (T.Y { a = 0xCAFEBABE, b = 0xDEADC0DE }) (env.mload Natural 0x00)))"
+          \ (env.sload T (env.sstore T (T.Y { a = 0xCAFEBABE, b = 0xDEADC0DE }) 0))"
       )
   bitraverse_
     print
@@ -202,6 +202,8 @@ data BuiltinValue
   | MStore
   | CallDataLoad
   | CallDataCopy
+  | SLoad
+  | SStore
   deriving (Enum, Bounded)
 
 instance Builtin BuiltinValue where
@@ -229,6 +231,8 @@ instance Builtin BuiltinValue where
   typeOf MStore = Pi Nothing "T" (Const Type) $ Pi Nothing "_" (Var $ V "T" 0) $ Pi Nothing "_" Natural Natural
   typeOf CallDataLoad = Pi Nothing "_" Natural Natural
   typeOf CallDataCopy = Pi Nothing "_" Natural $ Pi Nothing "_" Natural $ Pi Nothing "_" Natural $ Record mempty
+  typeOf SLoad = Pi Nothing "T" (Const Type) $ Pi Nothing "_" Natural $ Var $ V "T" 0
+  typeOf SStore = Pi Nothing "T" (Const Type) $ Pi Nothing "_" (Var $ V "T" 0) $ Pi Nothing "_" Natural Natural
 
   bindingOf CallValue = "callValue"
   bindingOf CallDataSize = "callDataSize"
@@ -254,6 +258,8 @@ instance Builtin BuiltinValue where
   bindingOf MStore = "mstore"
   bindingOf CallDataLoad = "callDataLoad"
   bindingOf CallDataCopy = "callDataCopy"
+  bindingOf SLoad = "sload"
+  bindingOf SStore = "sstore"
 
 instance BuiltinOpcode BuiltinValue where
   opcode CallValue = [CALLVALUE]
@@ -280,6 +286,8 @@ instance BuiltinOpcode BuiltinValue where
   opcode MStore = [MSTORE]
   opcode CallDataLoad = [CALLDATALOAD]
   opcode CallDataCopy = [CALLDATACOPY]
+  opcode SLoad = [SLOAD]
+  opcode SStore = [SSTORE]
 
 builtinOpcodes :: M.Map Text [LabelledOpcode]
 builtinOpcodes =
@@ -365,6 +373,19 @@ compile = doCompile
         size <- (`div` 32) <$> lift (sizeOf typeExpr)
         offset <- doCompile offsetExpr
         pure $ (\x -> offset <> [push $ x * 32, ADD, MLOAD]) =<< [0 .. size - 1]
+    -- Builtin env.sstore
+    doCompile (App (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr) offsetExpr)
+      | builtin == bindingOf SStore = do
+        size <- (`div` 32) <$> lift (sizeOf typeExpr)
+        value <- doCompile valueExpr
+        offset <- doCompile offsetExpr
+        pure $ value <> ((\x -> offset <> [push $ x + 1, push size, SUB, ADD, SSTORE]) =<< [0 .. size - 1]) <> offset
+    -- Builtin env.sload
+    doCompile (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) offsetExpr)
+      | builtin == bindingOf SLoad = do
+        size <- (`div` 32) <$> lift (sizeOf typeExpr)
+        offset <- doCompile offsetExpr
+        pure $ (\x -> offset <> [push x, ADD, SLOAD]) =<< [0 .. size - 1]
     -- Builtin env.<trivialUnaryFunction>
     doCompile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) x)
       | M.member builtin builtinOpcodes = do
