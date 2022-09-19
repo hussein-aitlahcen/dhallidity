@@ -89,9 +89,10 @@ execute = do
       load
       ( exprFromText
           "program"
-          "let T = < X: Natural | Y: { a: Natural, b: Natural } | Z: Natural > \
+          "let T = < A | X: Natural | Y: { a: Natural, b: Natural } | Z: Natural > \
           \ in merge \
-          \ { X = \\(x: Natural) -> x \
+          \ { A = env.mload Natural 0x00 \
+          \ , X = \\(x: Natural) -> x \
           \ , Y = \\(x: { a: Natural, b: Natural }) -> x.b + x.a \
           \ , Z = \\(x: Natural) -> x + x \
           \ } \
@@ -380,7 +381,9 @@ compile = doCompile
           let fields' = toMap fields
               index = M.findIndex y fields'
           size <- (`div` 32) <$> lift (sizeOf x)
-          variantSize <- (`div` 32) <$> lift (sizeOf (fromJust $ fields' M.! y))
+          variantSize <- case fields' M.! y of
+            Just field -> (`div` 32) <$> lift (sizeOf field)
+            Nothing -> pure 0
           liftIO $ print "Union"
           liftIO $ print variantSize
           liftIO $ print size
@@ -433,8 +436,10 @@ compile = doCompile
               match <- compile caseExpr
               label <- use nextLabel
               nextLabel += 1
-              let (RecordField _ (Lam _ binding _) _ _) = fields' !! i
-              variantSize <- (`div` 32) <$> lift (sizeOf $ functionBindingAnnotation binding)
+              variantSize <- case fields' !! i of
+                RecordField _ (Lam _ binding _) _ _ ->
+                  (`div` 32) <$> lift (sizeOf $ functionBindingAnnotation binding)
+                _ -> pure 0
               liftIO $ print $ "Size: " <> show unionSize <> ", Variant: " <> show variantSize
               pure
                 ( i + 1,
