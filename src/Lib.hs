@@ -22,14 +22,15 @@ import Data.Bifoldable (bitraverse_)
 import Data.Bits (Bits (..))
 import Data.DoubleWord (Word256 (Word256))
 import Data.Either (either, fromRight)
-import Data.Foldable (foldl', traverse_)
+import Data.Foldable (foldl', toList, traverse_)
 import Data.Functor.Identity (Identity (..))
 import qualified Data.Map as M
 import Data.Maybe (catMaybes, fromJust, fromMaybe)
 import Data.Monoid (Sum (..))
-import Data.Semigroup (Max (..))
+import Data.Semigroup (Max (..), Option (..))
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
 import Data.Void (Void)
 import Data.Word (Word64)
 import Dhall.Context (Context, empty, insert)
@@ -37,13 +38,14 @@ import Dhall.Core
   ( Const (..),
     Expr (..),
     FieldSelection (..),
-    FunctionBinding (functionBindingAnnotation, functionBindingVariable),
+    FunctionBinding (..),
     RecordField (..),
     Var (..),
     denote,
     makeRecordField,
     normalize,
   )
+import qualified Dhall.Core as C
 import Dhall.Import (load)
 import Dhall.Map (fromList, toMap)
 import Dhall.Parser (exprFromText)
@@ -84,17 +86,13 @@ execute :: IO ()
 execute = do
   {- Resulting hex bytecode can be decompiled on https://ethervm.io/decompile -}
   -- Parse + Resolve imports
+  programSource <- TIO.readFile "./C.dhall"
   program <-
     traverse
       load
       ( exprFromText
           "program"
-          "let Message = < SetValue: Natural | ResetValue > \
-          \ in merge \
-          \ { SetValue = \\(x: Natural) -> env.sstore Natural x 0 \
-          \ , ResetValue = env.sstore Natural 0 0 \
-          \ } \
-          \ (env.callDataLoad Message)"
+          programSource
       )
   bitraverse_
     print
@@ -102,9 +100,7 @@ execute = do
           bitraverse_
             print
             ( \programType ->
-                if fromRight (error "typechecked; qed;") (D.typeOf @Void programType) /= Const Type
-                  then error "must be type; sorry bro; qed;"
-                  else go programType validProgram
+                go programType validProgram
             )
             (D.typeWith initialContext validProgram)
       )
@@ -167,6 +163,14 @@ class Builtin a => BuiltinType a where
 class BuiltinOpcode a where
   opcode :: a -> [LabelledOpcode]
 
+data BuiltinEffect = BuiltinEffect
+
+instance Builtin BuiltinEffect where
+  typeOf _ = Const Type
+  bindingOf _ = "Effect"
+
+instance BuiltinType BuiltinEffect
+
 data BuiltinAddress = BuiltinAddress
 
 instance Builtin BuiltinAddress where
@@ -202,6 +206,8 @@ data BuiltinValue
   | CallDataCopy
   | SLoad
   | SStore
+  | Return
+  | Sequence
   deriving (Enum, Bounded)
 
 instance Builtin BuiltinValue where
@@ -226,11 +232,13 @@ instance Builtin BuiltinValue where
   typeOf Caller = referTo BuiltinAddress
   typeOf BalanceOf = Pi Nothing "_" (referTo BuiltinAddress) Natural
   typeOf MLoad = Pi Nothing "T" (Const Type) $ Pi Nothing "_" Natural $ Var $ V "T" 0
-  typeOf MStore = Pi Nothing "T" (Const Type) $ Pi Nothing "_" (Var $ V "T" 0) $ Pi Nothing "_" Natural Natural
+  typeOf MStore = Pi Nothing "T" (Const Type) $ Pi Nothing "_" (Var $ V "T" 0) $ Pi Nothing "_" Natural $ referTo BuiltinEffect
   typeOf CallDataLoad = Pi Nothing "T" (Const Type) $ Var $ V "T" 0
-  typeOf CallDataCopy = Pi Nothing "_" Natural $ Pi Nothing "_" Natural $ Pi Nothing "_" Natural $ Record mempty
+  typeOf CallDataCopy = Pi Nothing "_" Natural $ Pi Nothing "_" Natural $ Pi Nothing "_" Natural $ referTo BuiltinEffect
   typeOf SLoad = Pi Nothing "T" (Const Type) $ Pi Nothing "_" Natural $ Var $ V "T" 0
-  typeOf SStore = Pi Nothing "T" (Const Type) $ Pi Nothing "_" (Var $ V "T" 0) $ Pi Nothing "_" Natural Natural
+  typeOf SStore = Pi Nothing "T" (Const Type) $ Pi Nothing "_" (Var $ V "T" 0) $ Pi Nothing "_" Natural $ referTo BuiltinEffect
+  typeOf Return = Pi Nothing "T" (Const Type) $ Pi Nothing "_" (Var $ V "T" 0) $ referTo BuiltinEffect
+  typeOf Sequence = Pi Nothing "_" (App C.List (referTo BuiltinEffect)) $ referTo BuiltinEffect
 
   bindingOf CallValue = "callValue"
   bindingOf CallDataSize = "callDataSize"
@@ -258,6 +266,8 @@ instance Builtin BuiltinValue where
   bindingOf CallDataCopy = "callDataCopy"
   bindingOf SLoad = "sload"
   bindingOf SStore = "sstore"
+  bindingOf Return = "return"
+  bindingOf Sequence = "sequence"
 
 instance BuiltinOpcode BuiltinValue where
   opcode CallValue = [CALLVALUE]
@@ -286,6 +296,8 @@ instance BuiltinOpcode BuiltinValue where
   opcode CallDataCopy = [CALLDATACOPY]
   opcode SLoad = [SLOAD]
   opcode SStore = [SSTORE]
+  opcode Return = [RETURN]
+  opcode Sequence = []
 
 builtinOpcodes :: M.Map Text [LabelledOpcode]
 builtinOpcodes =
@@ -299,6 +311,7 @@ initialContext :: Context (Expr Void Void)
 initialContext =
   collapse
     [ (bindingOf BuiltinAddress, typeOf BuiltinAddress),
+      (bindingOf BuiltinEffect, typeOf BuiltinEffect),
       ( "env",
         Record $
           fromList $
@@ -319,7 +332,8 @@ maxWord256 = fromIntegral $ maxBound @Word256
 sizeOf :: Monad m => Expr Void Void -> ExceptT String m Word256
 sizeOf Natural = pure 32
 sizeOf (Union fields) = do
-  (+ 32) . maximum <$> traverse sizeOf (catMaybes $ M.elems $ toMap fields)
+  (+ 32) . maybe 0 getMax . foldMap (Just . Max)
+    <$> traverse sizeOf (catMaybes $ M.elems $ toMap fields)
 sizeOf (Record fields) = do
   sizes <- traverse (sizeOf . recordFieldValue) $ M.elems $ toMap fields
   pure $ getSum $ foldMap Sum sizes
@@ -340,9 +354,8 @@ getType x = do
   pure $ fromRight "typechecked; qed;" $ D.typeWith context x
 
 compile :: Expr Void Void -> StateT CplState (ExceptT String IO) [LabelledOpcode]
-compile = doCompile
+compile (Lam _ (FunctionBinding _ "Effect" _ _ _) (Lam _ (FunctionBinding _ "Address" _ _ _) (Lam _ (FunctionBinding _ "env" _ _ _) body))) = doCompile body
   where
-    doCompile :: Expr Void Void -> StateT CplState (ExceptT String IO) [LabelledOpcode]
     doCompile (NaturalLit x)
       | x <= maxWord256 = pure [push x]
     doCompile (IntegerLit x)
@@ -358,6 +371,10 @@ compile = doCompile
     doCompile (Field (Var (V "env" _)) (FieldSelection _ builtin _))
       | M.member builtin builtinOpcodes =
         pure $ fromMaybe (error "member; qed;") $ builtinOpcodes M.!? builtin
+    -- Builtin env.sequence
+    doCompile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) (ListLit _ effects))
+      | builtin == bindingOf Sequence =
+        mconcat . toList <$> traverse doCompile effects
     -- Builtin env.mstore
     doCompile (App (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr) offsetExpr)
       | builtin == bindingOf MStore = do
@@ -389,6 +406,28 @@ compile = doCompile
       | builtin == bindingOf CallDataLoad = do
         size <- (`div` 32) <$> lift (sizeOf typeExpr)
         pure $ (\x -> [push $ x * 32, CALLDATALOAD]) =<< [0 .. size - 1]
+    -- Builtin env.return
+    doCompile (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr)
+      | builtin == bindingOf Return = do
+        size <- lift (sizeOf typeExpr)
+        p <- doCompile valueExpr
+        q <-
+          doCompile
+            ( App
+                ( App
+                    ( App
+                        ( Field
+                            (Var (V "env" 0))
+                            (FieldSelection Nothing (bindingOf MStore) Nothing)
+                        )
+                        typeExpr
+                    )
+                    -- already on the stack
+                    (RecordLit mempty)
+                )
+                (NaturalLit 0)
+            )
+        pure $ p <> q <> [push size, push 0, RETURN]
     -- Builtin env.<trivialUnaryFunction>
     doCompile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) x)
       | M.member builtin builtinOpcodes = do
@@ -450,14 +489,14 @@ compile = doCompile
       mconcat . M.elems <$> traverse (doCompile . recordFieldValue) (toMap fields)
     doCompile (Merge (RecordLit fields) unionExpr c) = do
       liftIO $ print fields
-      p <- compile unionExpr
+      p <- doCompile unionExpr
       unionType <- getType unionExpr
       unionSize <- (`div` 32) <$> lift (sizeOf unionType)
       let fields' = M.elems $ toMap fields
       (_, q) <-
         foldM
           ( \(i, fallback) caseExpr -> do
-              match <- compile caseExpr
+              match <- doCompile caseExpr
               label <- use nextLabel
               nextLabel += 1
               variantSize <- case fields' !! i of
@@ -493,24 +532,23 @@ compile = doCompile
       localBindings %= M.insert var (CplVar ann slot)
       -- store
       p <-
-        compile
-          ( App
-              ( App
-                  ( App
-                      ( Field
-                          (Var (V "env" 0))
-                          (FieldSelection Nothing (bindingOf MStore) Nothing)
-                      )
-                      ann
-                  )
-                  -- already on the stack
-                  (RecordLit mempty)
-              )
-              (NaturalLit (fromIntegral $ slot * 32))
-          )
+        doCompile $
+          App
+            ( App
+                ( App
+                    ( Field
+                        (Var (V "env" 0))
+                        (FieldSelection Nothing (bindingOf MStore) Nothing)
+                    )
+                    ann
+                )
+                -- already on the stack
+                (RecordLit mempty)
+            )
+            (NaturalLit (fromIntegral $ slot * 32))
       -- alpha normalize with slot ref
       q <-
-        compile $
+        doCompile $
           normalize $
             App
               (Lam c binding body)
