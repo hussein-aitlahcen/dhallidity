@@ -22,11 +22,11 @@ let Env =
         , caller : Address
         , balanceOf : Address -> Natural
         , mload : forall (T : Type) -> Natural -> T
-        , mstore : forall (T : Type) -> T -> Natural -> Effect
+        , mstore : forall (T : Type) -> Natural -> T -> Effect
         , callDataLoad : forall (T : Type) -> T
         , sload : forall (T : Type) -> Natural -> T
-        , sstore : forall (T : Type) -> forall (x : T) -> Natural -> Effect
-        , return : forall (T : Type) -> forall (x : T) -> Effect
+        , sstore : forall (T : Type) -> Natural -> T -> Effect
+        , return : forall (T : Type) -> T -> Effect
         , sequence : List Effect -> Effect
         }
 
@@ -38,9 +38,9 @@ in  \(Store : Type) ->
     \(Address : Type) ->
     \(env : Env Effect Address) ->
       env.sequence
-        [ env.sstore Store initial 0
+        [ env.sstore Store 0 initial
         , env.sstore
             Store
-            (handler (env.sload Store 0) (env.callDataLoad Message))
             0
+            (handler (env.sload Store 0) (env.callDataLoad Message))
         ]

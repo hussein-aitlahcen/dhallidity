@@ -2,6 +2,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE PatternSynonyms #-}
@@ -44,9 +45,11 @@ import Dhall.Core
     RecordField (..),
     Var (..),
     denote,
+    makeFieldSelection,
     makeRecordField,
     normalize,
     recordFieldExprs,
+    recordFieldValue,
     subExpressions,
     subExpressionsWith,
   )
@@ -223,6 +226,7 @@ data BuiltinValue
   | SStore
   | Return
   | Sequence
+  | Unit
   deriving (Enum, Bounded)
 
 instance Builtin BuiltinValue where
@@ -251,9 +255,10 @@ instance Builtin BuiltinValue where
   typeOf CallDataLoad = Pi Nothing "T" (Const Type) $ Var $ V "T" 0
   typeOf CallDataCopy = Pi Nothing "_" Natural $ Pi Nothing "_" Natural $ Pi Nothing "_" Natural $ referTo BuiltinEffect
   typeOf SLoad = Pi Nothing "T" (Const Type) $ Pi Nothing "_" Natural $ Var $ V "T" 0
-  typeOf SStore = Pi Nothing "T" (Const Type) $ Pi Nothing "_" (Var $ V "T" 0) $ Pi Nothing "_" Natural $ referTo BuiltinEffect
+  typeOf SStore = Pi Nothing "T" (Const Type) $ Pi Nothing "_" Natural $ Pi Nothing "_" (Var $ V "T" 0) $ referTo BuiltinEffect
   typeOf Return = Pi Nothing "T" (Const Type) $ Pi Nothing "_" (Var $ V "T" 0) $ referTo BuiltinEffect
   typeOf Sequence = Pi Nothing "_" (App C.List (referTo BuiltinEffect)) $ referTo BuiltinEffect
+  typeOf Unit = referTo BuiltinEffect
 
   bindingOf CallValue = "callValue"
   bindingOf CallDataSize = "callDataSize"
@@ -283,6 +288,7 @@ instance Builtin BuiltinValue where
   bindingOf SStore = "sstore"
   bindingOf Return = "return"
   bindingOf Sequence = "sequence"
+  bindingOf Unit = "unit"
 
 instance BuiltinOpcode BuiltinValue where
   opcode CallValue = [CALLVALUE]
@@ -313,6 +319,7 @@ instance BuiltinOpcode BuiltinValue where
   opcode SStore = [SSTORE]
   opcode Return = [RETURN]
   opcode Sequence = []
+  opcode Unit = []
 
 builtinOpcodes :: M.Map Text [LabelledOpcode]
 builtinOpcodes =
@@ -389,6 +396,34 @@ matchBuiltin x y = bindingOf x == y
 
 simplify :: (MonadIO m, MonadError String m) => Expr Void Void -> m (Expr Void Void)
 simplify
+  ( App
+      ( App
+          ( App
+              ( Field
+                  (Var (V "env" _))
+                  (FieldSelection _ (matchBuiltin SStore -> True) _)
+                )
+              t0
+            )
+          o0
+        )
+      ( App
+          ( App
+              ( Field
+                  (Var (V "env" _))
+                  (FieldSelection _ (matchBuiltin SLoad -> True) _)
+                )
+              t1
+            )
+          o1
+        )
+    )
+    | t0 == t1 && o0 == o1 =
+      pure $
+        Field
+          (Var (V "env" 0))
+          (makeFieldSelection $ bindingOf Unit)
+simplify
   ( Field
       ( App
           ( App
@@ -402,24 +437,21 @@ simplify
         )
       fieldSelection
     ) = do
-    typeExpr' <-
-      simplify
-        typeExpr
-    case typeExpr' of
+    case typeExpr of
       (Record fields) -> do
         let fieldName = fieldSelection ^. to fieldSelectionLabel
         liftIO $ print fieldName
-        liftIO $ print $ prettyExpr typeExpr'
+        liftIO $ print $ prettyExpr typeExpr
         liftIO $ print $ prettyExpr offsetExpr
         fieldOffset <-
-          (`div` 32) <$> offsetOf fieldName typeExpr'
+          (`div` 32) <$> offsetOf fieldName typeExpr
         finalOffset <-
           simplify
             ( NaturalPlus
                 offsetExpr
                 (NaturalLit $ fromIntegral fieldOffset)
             )
-        pure $
+        simplify $
           App
             ( App
                 e
@@ -429,6 +461,57 @@ simplify
                 )
             )
             finalOffset
+simplify
+  ( App
+      a@( App
+            b@( App
+                  e@( Field
+                        (Var (V "env" _))
+                        (FieldSelection _ (matchBuiltin SStore -> True) _)
+                      )
+                  typeExpr
+                )
+            offsetExpr
+          )
+      x
+    ) = do
+    x' <- simplify x
+    case (typeExpr, x) of
+      (_, Merge branchExprs valueExpr mergeTypeExpr) ->
+        Merge
+          <$> subExpressions
+            ( \case
+                (Lam c bindings body) ->
+                  Lam c bindings <$> simplify (App a body)
+                z -> pure $ App a z
+            )
+            branchExprs
+          <*> pure valueExpr
+          <*> pure mergeTypeExpr
+      (Record fieldTypes, RecordLit fields) ->
+        RecordLit
+          <$> DM.traverseWithKey
+            ( \fieldName field -> do
+                fieldValue <- simplify $ recordFieldValue field
+                valueOffset <- (`div` 32) <$> offsetOf fieldName typeExpr
+                newValue <-
+                  simplify $
+                    App
+                      ( App
+                          ( App
+                              e
+                              (recordFieldValue $ fromMaybe (error "typechecked; qed") $ DM.lookup fieldName fieldTypes)
+                          )
+                          ( NaturalPlus
+                              offsetExpr
+                              (NaturalLit $ fromIntegral valueOffset)
+                          )
+                      )
+                      fieldValue
+                pure $ field {recordFieldValue = newValue}
+            )
+            fields
+      (_, x) -> pure $ App a x
 simplify x =
   subExpressions simplify x
 
@@ -464,7 +547,7 @@ compile
         | builtin == bindingOf Sequence =
           mconcat . toList <$> traverse doCompile effects
       -- Builtin env.mstore
-      doCompile (App (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr) offsetExpr)
+      doCompile (App (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) offsetExpr) valueExpr)
         | builtin == bindingOf MStore = do
           size <- (`div` 32) <$> lift (sizeOf typeExpr)
           value <- doCompile valueExpr
@@ -477,7 +560,7 @@ compile
           offset <- doCompile offsetExpr
           pure $ (\x -> offset <> [push $ x * 32, ADD, MLOAD]) =<< [0 .. size - 1]
       -- Builtin env.sstore
-      doCompile (App (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr) offsetExpr)
+      doCompile (App (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) offsetExpr) valueExpr)
         | builtin == bindingOf SStore = do
           size <- (`div` 32) <$> lift (sizeOf typeExpr)
           value <- doCompile valueExpr
@@ -510,10 +593,10 @@ compile
                           )
                           typeExpr
                       )
-                      -- already on the stack
-                      (RecordLit mempty)
+                      (NaturalLit 0)
                   )
-                  (NaturalLit 0)
+                  -- already on the stack
+                  (RecordLit mempty)
               )
           pure $ p <> q <> [push size, push 0, RETURN]
       -- Builtin env.<trivialUnaryFunction>
