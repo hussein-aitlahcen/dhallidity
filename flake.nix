@@ -14,6 +14,8 @@
             secp256k1
             libff
             (haskell-language-server.override { supportedGhcVersions = ["902"] ; })
+            haskell.compiler.ghc902
+            cabal-install
           ];
         };
       });

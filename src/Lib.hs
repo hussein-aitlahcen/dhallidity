@@ -1,11 +1,13 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE ViewPatterns #-}
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 {-# HLINT ignore "Avoid lambda using `infix`" #-}
@@ -15,7 +17,7 @@ module Lib (execute) where
 
 import Control.Lens hiding (Const, Context)
 import Control.Monad (foldM, guard, when)
-import Control.Monad.Except (ExceptT (..), runExceptT, throwError)
+import Control.Monad.Except (ExceptT (..), MonadError, runExceptT, throwError)
 import Control.Monad.State.Strict (MonadIO (liftIO), StateT (..))
 import Control.Monad.Trans (lift)
 import Data.Bifoldable (bitraverse_)
@@ -44,10 +46,14 @@ import Dhall.Core
     denote,
     makeRecordField,
     normalize,
+    recordFieldExprs,
+    subExpressions,
+    subExpressionsWith,
   )
 import qualified Dhall.Core as C
 import Dhall.Import (load)
 import Dhall.Map (fromList, toMap)
+import qualified Dhall.Map as DM
 import Dhall.Parser (exprFromText)
 import Dhall.Pretty (prettyExpr)
 import qualified Dhall.TypeCheck as D (typeOf, typeWith)
@@ -122,13 +128,25 @@ execute = do
       putStrLn "<<==========>>"
       putStrLn ""
       print $ prettyExpr validProgram
+      let naivelyNormalized = normalize @_ @_ @Void validProgram
+          simplifyToFixpoint program = do
+            normalizedProgram <- simplify program
+            if normalizedProgram == program
+              then pure $ normalize program
+              else simplifyToFixpoint normalizedProgram
+      ((compiled, normalized), _) <-
+        fmap (either (error . show) id) $
+          runExceptT $
+            flip runStateT (CplState mempty 0 rESERVED_LOCALS) $
+              do
+                normalized <- simplifyToFixpoint naivelyNormalized
+                compiled <- compile normalized
+                pure (compiled, normalized)
       putStrLn ""
       putStrLn "<<================>>"
       putStrLn "<<== NORMALIZED ==>>"
       putStrLn "<<================>>"
       putStrLn ""
-      let normalized :: Expr Void Void
-          !normalized = normalize validProgram
       print $ prettyExpr normalized
       putStrLn ""
       putStrLn "<<========================>>"
@@ -136,9 +154,6 @@ execute = do
       putStrLn "<<========================>>"
       putStrLn ""
       putStrLn ">> Compiling..."
-      (compiled, _) <-
-        either (error . show) id
-          <$> runExceptT (runStateT (compile normalized) (CplState mempty 0 rESERVED_LOCALS))
       putStrLn ">> Compilation done."
       print $ ">> Bytecode: " <> show compiled
       putStrLn ""
@@ -329,7 +344,7 @@ initialContext =
 maxWord256 :: Natural
 maxWord256 = fromIntegral $ maxBound @Word256
 
-sizeOf :: Monad m => Expr Void Void -> ExceptT String m Word256
+sizeOf :: MonadError String m => Expr Void Void -> m Word256
 sizeOf Natural = pure 32
 sizeOf (Union fields) = do
   (+ 32) . maybe 0 getMax . foldMap (Just . Max)
@@ -339,7 +354,7 @@ sizeOf (Record fields) = do
   pure $ getSum $ foldMap Sum sizes
 sizeOf x = throwError $ "Not sizeable: " <> show x
 
-offsetOf :: Monad m => Text -> Expr Void Void -> ExceptT String m Word256
+offsetOf :: MonadError String m => Text -> Expr Void Void -> m Word256
 offsetOf _ (Union _) = pure 32
 offsetOf field (Record fields) = do
   let fields' = toMap fields
@@ -353,221 +368,294 @@ getType x = do
   let context = M.foldrWithKey insert initialContext (view typ <$> extraContext)
   pure $ fromRight "typechecked; qed;" $ D.typeWith context x
 
-compile :: Expr Void Void -> StateT CplState (ExceptT String IO) [LabelledOpcode]
-compile (Lam _ (FunctionBinding _ "Effect" _ _ _) (Lam _ (FunctionBinding _ "Address" _ _ _) (Lam _ (FunctionBinding _ "env" _ _ _) body))) = doCompile body
-  where
-    doCompile (NaturalLit x)
-      | x <= maxWord256 = pure [push x]
-    doCompile (IntegerLit x)
-      | x <= fromIntegral maxWord256 = pure [push x]
-    doCompile (NaturalPlus x y) = do
-      p <- doCompile y
-      q <- doCompile x
-      pure $ p <> q <> [ADD]
-    doCompile (App (App NaturalSubtract x) y) = do
-      p <- doCompile y
-      q <- doCompile x
-      pure $ p <> q <> [SUB]
-    doCompile (Field (Var (V "env" _)) (FieldSelection _ builtin _))
-      | M.member builtin builtinOpcodes =
-        pure $ fromMaybe (error "member; qed;") $ builtinOpcodes M.!? builtin
-    -- Builtin env.sequence
-    doCompile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) (ListLit _ effects))
-      | builtin == bindingOf Sequence =
-        mconcat . toList <$> traverse doCompile effects
-    -- Builtin env.mstore
-    doCompile (App (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr) offsetExpr)
-      | builtin == bindingOf MStore = do
-        size <- (`div` 32) <$> lift (sizeOf typeExpr)
-        value <- doCompile valueExpr
-        offset <- doCompile offsetExpr
-        pure $ value <> ((\x -> offset <> [push $ (x + 1) * 32, push $ size * 32, SUB, ADD, MSTORE]) =<< [0 .. size - 1]) <> offset
-    -- Builtin env.mload
-    doCompile (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) offsetExpr)
-      | builtin == bindingOf MLoad = do
-        size <- (`div` 32) <$> lift (sizeOf typeExpr)
-        offset <- doCompile offsetExpr
-        pure $ (\x -> offset <> [push $ x * 32, ADD, MLOAD]) =<< [0 .. size - 1]
-    -- Builtin env.sstore
-    doCompile (App (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr) offsetExpr)
-      | builtin == bindingOf SStore = do
-        size <- (`div` 32) <$> lift (sizeOf typeExpr)
-        value <- doCompile valueExpr
-        offset <- doCompile offsetExpr
-        pure $ value <> ((\x -> offset <> [push $ x + 1, push size, SUB, ADD, SSTORE]) =<< [0 .. size - 1]) <> offset
-    -- Builtin env.sload
-    doCompile (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) offsetExpr)
-      | builtin == bindingOf SLoad = do
-        size <- (`div` 32) <$> lift (sizeOf typeExpr)
-        offset <- doCompile offsetExpr
-        pure $ (\x -> offset <> [push x, ADD, SLOAD]) =<< [0 .. size - 1]
-    -- Builtin env.callDataLoad
-    doCompile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr)
-      | builtin == bindingOf CallDataLoad = do
-        size <- (`div` 32) <$> lift (sizeOf typeExpr)
-        pure $ (\x -> [push $ x * 32, CALLDATALOAD]) =<< [0 .. size - 1]
-    -- Builtin env.return
-    doCompile (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr)
-      | builtin == bindingOf Return = do
-        size <- lift (sizeOf typeExpr)
-        p <- doCompile valueExpr
-        q <-
-          doCompile
-            ( App
-                ( App
-                    ( App
-                        ( Field
-                            (Var (V "env" 0))
-                            (FieldSelection Nothing (bindingOf MStore) Nothing)
-                        )
-                        typeExpr
-                    )
-                    -- already on the stack
-                    (RecordLit mempty)
-                )
-                (NaturalLit 0)
+pattern AppX :: Expr Void Void
+pattern AppX = App (NaturalLit 0) (NaturalLit 0)
+
+pattern MatchSLoad :: Text -> Expr Void Void
+pattern MatchSLoad builtin <-
+  ( App
+      ( App
+          e@( Field
+                (Var (V "env" _))
+                (FieldSelection _ builtin _)
+              )
+          _
+        )
+      _
+    )
+
+matchBuiltin :: Builtin a => a -> Text -> Bool
+matchBuiltin x y = bindingOf x == y
+
+simplify :: (MonadIO m, MonadError String m) => Expr Void Void -> m (Expr Void Void)
+simplify
+  ( Field
+      ( App
+          ( App
+              e@( Field
+                    (Var (V "env" _))
+                    (FieldSelection _ (matchBuiltin SLoad -> True) _)
+                  )
+              typeExpr
             )
-        pure $ p <> q <> [push size, push 0, RETURN]
-    -- Builtin env.<trivialUnaryFunction>
-    doCompile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) x)
-      | M.member builtin builtinOpcodes = do
-        p <- doCompile x
-        pure $ p <> fromMaybe (error "member; qed;") (builtinOpcodes M.!? builtin)
-    doCompile (App x y) = do
-      p <- doCompile y
-      q <- doCompile x
-      pure $ p <> q
-    doCompile (Field x (FieldSelection _ y _)) = do
-      tyX <- getType x
-      case (tyX, x) of
-        (Const Type, ty@(Union fields)) -> do
-          let fields' = toMap fields
-              index = M.findIndex y fields'
-          size <- (`div` 32) <$> lift (sizeOf x)
-          variantSize <- case fields' M.! y of
-            Just field -> (`div` 32) <$> lift (sizeOf field)
-            Nothing -> pure 0
-          liftIO $ print "Union"
-          liftIO $ print variantSize
-          liftIO $ print size
-          liftIO $ print x
-          pure $ replicate (fromIntegral $ size - variantSize - 1) (push 0) <> [push index]
-        (ty@(Record fields), _) -> do
-          let (RecordField _ fieldTy _ _) = toMap fields M.! y
-          offset <- (`div` 32) <$> lift (offsetOf y ty)
-          size <- (`div` 32) <$> lift (sizeOf ty)
-          fieldSize <- (`div` 32) <$> lift (sizeOf fieldTy)
-          let stackMax = size
-              fieldStackStart = size - offset - 1
-              fieldStackEnd = fieldStackStart - fieldSize + 1
-              tail = stackMax - fieldStackEnd - fieldSize
-          liftIO $ putStrLn "==============="
-          liftIO $ print $ "Size: " <> show size
-          liftIO $ print $ "FieldSize: " <> show fieldSize
-          liftIO $ print $ "Offset: " <> show offset
-          liftIO $ print $ "Tail: " <> show tail
-          liftIO $
-            putStrLn $
-              "Selecting " <> T.unpack y
-                <> " of type "
-                <> show (prettyExpr fieldTy)
-                <> " at offset "
-                <> show offset
-                <> " in "
-                <> show (prettyExpr ty)
-          p <- doCompile x
-          let storeTemp i = [push $ (fieldSize - i - 1) * 32] <> mload 0x00 <> [ADD, MSTORE]
-              restoreTemp i = [push $ i * 32] <> mload 0x00 <> [ADD, MLOAD]
-          pure $
-            p
-              <> replicate (fromIntegral fieldStackEnd) POP
-              <> (storeTemp =<< [0 .. fieldSize - 1])
-              <> replicate (fromIntegral tail) POP
-              <> (restoreTemp =<< [0 .. fieldSize - 1])
-        x -> error $ show x
-    doCompile (RecordLit fields) = do
-      mconcat . M.elems <$> traverse (doCompile . recordFieldValue) (toMap fields)
-    doCompile (Merge (RecordLit fields) unionExpr c) = do
-      liftIO $ print fields
-      p <- doCompile unionExpr
-      unionType <- getType unionExpr
-      unionSize <- (`div` 32) <$> lift (sizeOf unionType)
-      let fields' = M.elems $ toMap fields
-      (_, q) <-
-        foldM
-          ( \(i, fallback) caseExpr -> do
-              match <- doCompile caseExpr
-              label <- use nextLabel
-              nextLabel += 1
-              variantSize <- case fields' !! i of
-                RecordField _ (Lam _ binding _) _ _ ->
-                  (`div` 32) <$> lift (sizeOf $ functionBindingAnnotation binding)
-                _ -> pure 0
-              liftIO $ print $ "Size: " <> show unionSize <> ", Variant: " <> show variantSize
-              pure
-                ( i + 1,
-                  iff
-                    label
-                    [DUP1, push i, O.EQ]
-                    -- pop the tag and padding as we wipe the union when matching
-                    (replicate (fromIntegral $ unionSize - variantSize) POP <> match)
-                    fallback
-                )
-          )
-          (0, [push 0, push 0, REVERT])
-          (recordFieldValue <$> fields')
-      pure $ p <> q
-    doCompile (Lam c binding body) = do
-      let ann = functionBindingAnnotation binding
-          var = functionBindingVariable binding
-      size <- (`div` 32) <$> lift (sizeOf ann)
-      slot <- use memorySlotNext
-      memorySlotNext += size
-      when
-        (slot + size > mAX_DYNAMIC_LOCALS)
-        (throwError "Ser, memory has limits...")
-      liftIO $ putStrLn "==============="
-      liftIO $ print $ "ValueType: " <> prettyExpr ann
-      liftIO $ print $ "Slot: " <> show slot
-      localBindings %= M.insert var (CplVar ann slot)
-      -- store
-      p <-
-        doCompile $
+          offsetExpr
+        )
+      fieldSelection
+    ) = do
+    typeExpr' <-
+      simplify
+        typeExpr
+    case typeExpr' of
+      (Record fields) -> do
+        let fieldName = fieldSelection ^. to fieldSelectionLabel
+        liftIO $ print fieldName
+        liftIO $ print $ prettyExpr typeExpr'
+        liftIO $ print $ prettyExpr offsetExpr
+        fieldOffset <-
+          (`div` 32) <$> offsetOf fieldName typeExpr'
+        finalOffset <-
+          simplify
+            ( NaturalPlus
+                offsetExpr
+                (NaturalLit $ fromIntegral fieldOffset)
+            )
+        pure $
           App
             ( App
-                ( App
-                    ( Field
-                        (Var (V "env" 0))
-                        (FieldSelection Nothing (bindingOf MStore) Nothing)
-                    )
-                    ann
+                e
+                ( recordFieldValue $
+                    fromMaybe (error "typechecked; qed;") $
+                      DM.lookup fieldName fields
                 )
-                -- already on the stack
-                (RecordLit mempty)
             )
-            (NaturalLit (fromIntegral $ slot * 32))
-      -- alpha normalize with slot ref
-      q <-
-        doCompile $
-          normalize $
+            finalOffset
+simplify x =
+  subExpressions simplify x
+
+compile :: Expr Void Void -> StateT CplState (ExceptT String IO) [LabelledOpcode]
+compile
+  ( Lam
+      _
+      (FunctionBinding _ "Effect" _ _ _)
+      ( Lam
+          _
+          (FunctionBinding _ "Address" _ _ _)
+          (Lam _ (FunctionBinding _ "env" _ _ _) body)
+        )
+    ) = doCompile body
+    where
+      doCompile (NaturalLit x)
+        | x <= maxWord256 = pure [push x]
+      doCompile (IntegerLit x)
+        | x <= fromIntegral maxWord256 = pure [push x]
+      doCompile (NaturalPlus x y) = do
+        p <- doCompile y
+        q <- doCompile x
+        pure $ p <> q <> [ADD]
+      doCompile (App (App NaturalSubtract x) y) = do
+        p <- doCompile y
+        q <- doCompile x
+        pure $ p <> q <> [SUB]
+      doCompile (Field (Var (V "env" _)) (FieldSelection _ builtin _))
+        | M.member builtin builtinOpcodes =
+          pure $ fromMaybe (error "member; qed;") $ builtinOpcodes M.!? builtin
+      -- Builtin env.sequence
+      doCompile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) (ListLit _ effects))
+        | builtin == bindingOf Sequence =
+          mconcat . toList <$> traverse doCompile effects
+      -- Builtin env.mstore
+      doCompile (App (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr) offsetExpr)
+        | builtin == bindingOf MStore = do
+          size <- (`div` 32) <$> lift (sizeOf typeExpr)
+          value <- doCompile valueExpr
+          offset <- doCompile offsetExpr
+          pure $ value <> ((\x -> offset <> [push $ (x + 1) * 32, push $ size * 32, SUB, ADD, MSTORE]) =<< [0 .. size - 1])
+      -- Builtin env.mload
+      doCompile (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) offsetExpr)
+        | builtin == bindingOf MLoad = do
+          size <- (`div` 32) <$> lift (sizeOf typeExpr)
+          offset <- doCompile offsetExpr
+          pure $ (\x -> offset <> [push $ x * 32, ADD, MLOAD]) =<< [0 .. size - 1]
+      -- Builtin env.sstore
+      doCompile (App (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr) offsetExpr)
+        | builtin == bindingOf SStore = do
+          size <- (`div` 32) <$> lift (sizeOf typeExpr)
+          value <- doCompile valueExpr
+          offset <- doCompile offsetExpr
+          pure $ value <> ((\x -> offset <> [push $ x + 1, push size, SUB, ADD, SSTORE]) =<< [0 .. size - 1])
+      -- Builtin env.sload
+      doCompile (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) offsetExpr)
+        | builtin == bindingOf SLoad = do
+          size <- (`div` 32) <$> lift (sizeOf typeExpr)
+          offset <- doCompile offsetExpr
+          pure $ (\x -> offset <> [push x, ADD, SLOAD]) =<< [0 .. size - 1]
+      -- Builtin env.callDataLoad
+      doCompile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr)
+        | builtin == bindingOf CallDataLoad = do
+          size <- (`div` 32) <$> lift (sizeOf typeExpr)
+          pure $ (\x -> [push $ x * 32, CALLDATALOAD]) =<< [0 .. size - 1]
+      -- Builtin env.return
+      doCompile (App (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) typeExpr) valueExpr)
+        | builtin == bindingOf Return = do
+          size <- lift (sizeOf typeExpr)
+          p <- doCompile valueExpr
+          q <-
+            doCompile
+              ( App
+                  ( App
+                      ( App
+                          ( Field
+                              (Var (V "env" 0))
+                              (FieldSelection Nothing (bindingOf MStore) Nothing)
+                          )
+                          typeExpr
+                      )
+                      -- already on the stack
+                      (RecordLit mempty)
+                  )
+                  (NaturalLit 0)
+              )
+          pure $ p <> q <> [push size, push 0, RETURN]
+      -- Builtin env.<trivialUnaryFunction>
+      doCompile (App (Field (Var (V "env" _)) (FieldSelection _ builtin _)) x)
+        | M.member builtin builtinOpcodes = do
+          p <- doCompile x
+          pure $ p <> fromMaybe (error "member; qed;") (builtinOpcodes M.!? builtin)
+      doCompile (App x y) = do
+        p <- doCompile y
+        q <- doCompile x
+        pure $ p <> q
+      doCompile (Field x (FieldSelection _ y _)) = do
+        tyX <- getType x
+        case (tyX, x) of
+          (Const Type, ty@(Union fields)) -> do
+            let fields' = toMap fields
+                index = M.findIndex y fields'
+            size <- (`div` 32) <$> lift (sizeOf x)
+            variantSize <- case fields' M.! y of
+              Just field -> (`div` 32) <$> lift (sizeOf field)
+              Nothing -> pure 0
+            liftIO $ print "Union"
+            liftIO $ print variantSize
+            liftIO $ print size
+            liftIO $ print x
+            pure $ replicate (fromIntegral $ size - variantSize - 1) (push 0) <> [push index]
+          (ty@(Record fields), _) -> do
+            let (RecordField _ fieldTy _ _) = toMap fields M.! y
+            offset <- (`div` 32) <$> lift (offsetOf y ty)
+            size <- (`div` 32) <$> lift (sizeOf ty)
+            fieldSize <- (`div` 32) <$> lift (sizeOf fieldTy)
+            let stackMax = size
+                fieldStackStart = size - offset - 1
+                fieldStackEnd = fieldStackStart - fieldSize + 1
+                tail = stackMax - fieldStackEnd - fieldSize
+            liftIO $ putStrLn "==============="
+            liftIO $ print $ "Size: " <> show size
+            liftIO $ print $ "FieldSize: " <> show fieldSize
+            liftIO $ print $ "Offset: " <> show offset
+            liftIO $ print $ "Tail: " <> show tail
+            liftIO $
+              putStrLn $
+                "Selecting " <> T.unpack y
+                  <> " of type "
+                  <> show (prettyExpr fieldTy)
+                  <> " at offset "
+                  <> show offset
+                  <> " in "
+                  <> show (prettyExpr ty)
+            p <- doCompile x
+            let storeTemp i = [push $ (fieldSize - i - 1) * 32] <> mload 0x00 <> [ADD, MSTORE]
+                restoreTemp i = [push $ i * 32] <> mload 0x00 <> [ADD, MLOAD]
+            pure $
+              p
+                <> replicate (fromIntegral fieldStackEnd) POP
+                <> (storeTemp =<< [0 .. fieldSize - 1])
+                <> replicate (fromIntegral tail) POP
+                <> (restoreTemp =<< [0 .. fieldSize - 1])
+          x -> error $ show x
+      doCompile (RecordLit fields) = do
+        mconcat . M.elems <$> traverse (doCompile . recordFieldValue) (toMap fields)
+      doCompile (Merge (RecordLit fields) unionExpr c) = do
+        liftIO $ print fields
+        p <- doCompile unionExpr
+        unionType <- getType unionExpr
+        unionSize <- (`div` 32) <$> lift (sizeOf unionType)
+        let fields' = M.elems $ toMap fields
+        (_, q) <-
+          foldM
+            ( \(i, fallback) caseExpr -> do
+                match <- doCompile caseExpr
+                label <- use nextLabel
+                nextLabel += 1
+                variantSize <- case fields' !! i of
+                  RecordField _ (Lam _ binding _) _ _ ->
+                    (`div` 32) <$> lift (sizeOf $ functionBindingAnnotation binding)
+                  _ -> pure 0
+                liftIO $ print $ "Size: " <> show unionSize <> ", Variant: " <> show variantSize
+                pure
+                  ( i + 1,
+                    iff
+                      label
+                      [DUP1, push i, O.EQ]
+                      -- pop the tag and padding as we wipe the union when matching
+                      (replicate (fromIntegral $ unionSize - variantSize) POP <> match)
+                      fallback
+                  )
+            )
+            (0, [push 0, push 0, REVERT])
+            (recordFieldValue <$> fields')
+        pure $ p <> q
+      doCompile (Lam c binding body) = do
+        let ann = functionBindingAnnotation binding
+            var = functionBindingVariable binding
+        size <- (`div` 32) <$> lift (sizeOf ann)
+        slot <- use memorySlotNext
+        memorySlotNext += size
+        when
+          (slot + size > mAX_DYNAMIC_LOCALS)
+          (throwError "Ser, memory has limits...")
+        liftIO $ putStrLn "==============="
+        liftIO $ print $ "ValueType: " <> prettyExpr ann
+        liftIO $ print $ "Slot: " <> show slot
+        localBindings %= M.insert var (CplVar ann slot)
+        -- store
+        p <-
+          doCompile $
             App
-              (Lam c binding body)
               ( App
                   ( App
                       ( Field
                           (Var (V "env" 0))
-                          (FieldSelection Nothing (bindingOf MLoad) Nothing)
+                          (FieldSelection Nothing (bindingOf MStore) Nothing)
                       )
                       ann
                   )
-                  (NaturalLit (fromIntegral $ slot * 32))
+                  -- already on the stack
+                  (RecordLit mempty)
               )
-      localBindings %= M.delete var
-      -- trick: pop the returned offset
-      pure $ p <> (POP : q)
-    doCompile (Union _) = pure []
-    doCompile (Record _) = pure []
-    doCompile x = error $ "Ser, everything has limits... " <> show x
+              (NaturalLit (fromIntegral $ slot * 32))
+        -- alpha normalize with slot ref
+        q <-
+          doCompile $
+            normalize $
+              App
+                (Lam c binding body)
+                ( App
+                    ( App
+                        ( Field
+                            (Var (V "env" 0))
+                            (FieldSelection Nothing (bindingOf MLoad) Nothing)
+                        )
+                        ann
+                    )
+                    (NaturalLit (fromIntegral $ slot * 32))
+                )
+        localBindings %= M.delete var
+        -- trick: pop the returned offset
+        pure $ p <> q
+      doCompile (Union _) = pure []
+      doCompile (Record _) = pure []
+      doCompile x = error $ "Ser, everything has limits... " <> show x
 
 freepointer :: [LabelledOpcode]
 freepointer = [push 0x00, MLOAD]
